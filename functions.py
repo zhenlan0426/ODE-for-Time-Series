@@ -18,15 +18,15 @@ from torch.nn.utils import clip_grad_value_
 
 emb_dims,emb_card = [4,8,16,16,32,4],[5,12,31,24,60,7]
 d_raw = 7
-X_len, y_len = 512,64
+X_len, y_len = 680,64
 device = 'cuda' #'cpu'
-max_len = 50 # # of batches for each epoch of training
+rtol, atol = 1e-3, 1e-5
 
 # =============================================================================
 # Data
 # =============================================================================
 class CustomDataset(Dataset):
-    def __init__(self, X, date, y, X_len, y_len, max_len=None):
+    def __init__(self, X, date, y, X_len, y_len, IsTrain):
         self.X = X
         self.y = y
         self.date = date
@@ -34,13 +34,13 @@ class CustomDataset(Dataset):
         self.X_len = X_len
         self.y_len = y_len
         self.seq_len = X_len + y_len
-        self.max_len = max_len # dont run though all examples in training in one epoch
-
+        self.IsTrain = IsTrain
+        
     def __len__(self):
-        return (self.length//self.seq_len) - 1 if self.max_len is None else self.max_len
+        return (self.length//self.seq_len) - 1
 
     def __getitem__(self, idx):
-        idx_batch = idx * self.seq_len
+        idx_batch = idx * self.seq_len + (np.random.randint(0,self.seq_len-5) if self.IsTrain else 0)
         return self.X[idx_batch:idx_batch+self.X_len],self.date[idx_batch:idx_batch+self.X_len],\
                 self.y[idx_batch+self.X_len:idx_batch+self.X_len+self.y_len]
 
@@ -53,8 +53,8 @@ def get_data(batchSize):
     date_train = np.load('date_train.npy')
     date_val = np.load('date_val.npy')
     
-    data_val = DataLoader(CustomDataset(X_val,date_val,y_val, X_len, y_len),batchSize,False)
-    data_train = DataLoader(CustomDataset(X_train,date_train,y_train, X_len, y_len,max_len),batchSize,True)
+    data_val = DataLoader(CustomDataset(X_val,date_val,y_val, X_len, y_len,False),batchSize,False)
+    data_train = DataLoader(CustomDataset(X_train,date_train,y_train, X_len, y_len,True),batchSize,True)
     return data_val,data_train # N,T,d
 
 
@@ -71,7 +71,7 @@ class ODEWrap(nn.Module):
         self.odefunc = odefunc
 
     def forward(self, x, integration_time):
-        out = odeint_adjoint(self.odefunc, x, integration_time)
+        out = odeint_adjoint(self.odefunc, x, integration_time, rtol=rtol, atol=atol, adjoint_rtol=rtol, adjoint_atol=atol)
         return out[1:]
 
 class func_time(nn.Module):
@@ -88,7 +88,7 @@ class func_time(nn.Module):
         self.networks = nn.Sequential(*networks[:-1])
     
     def forward(self,t,x):
-        x += self.time_fun(t,x)
+        x = x + self.time_fun(t,x)
         return self.networks(x)
 
 class attention(nn.MultiheadAttention):
@@ -114,7 +114,7 @@ class func_depth(nn.Module):
         self.networks = nn.Sequential(*networks[:-1])
     
     def forward(self,t,x):
-        x += self.time_fun(t,x)
+        x = x + self.time_fun(t,x)
         return self.networks(x)
 
 # d, d_target, layers_time, layers_depth, num_heads, BN, dropout, T = 16,7,2,2,4,True,0.1,12
@@ -194,7 +194,7 @@ class ODE_timeSeries(nn.Module):
 
 def train(opt,model,epochs,train_dl,val_dl,paras,clip,verbose=True,save=False):
     since = time.time()
-    lossBest = 1e6
+    lossBest = 1e9
     opt.zero_grad()
     for epoch in range(epochs):
         # training #
@@ -210,7 +210,8 @@ def train(opt,model,epochs,train_dl,val_dl,paras,clip,verbose=True,save=False):
             opt.step()
             opt.zero_grad()
             train_loss += loss.item()
-            
+            # if verbose:
+            #     print('batch:{}, train_loss:{:+.3f} \n'.format(i,loss.item()))
         # evaluating #
         model.eval()
         with torch.no_grad():
@@ -224,7 +225,7 @@ def train(opt,model,epochs,train_dl,val_dl,paras,clip,verbose=True,save=False):
             lossBest = val_loss
             if save: bestWeight = copy.deepcopy(model.state_dict())   
         if verbose:
-            print('epoch:{}, train_loss: {:+.3f}, val_loss: {:+.3f} \n'.format(epoch,train_loss/i,val_loss/j))
+            print('epoch:{}, train_loss:{:+.3f}, val_loss:{:+.3f} \n'.format(epoch,train_loss/i,val_loss/j))
 
     
     if save: model.load_state_dict(bestWeight)
